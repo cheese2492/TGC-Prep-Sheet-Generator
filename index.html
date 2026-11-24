@@ -119,9 +119,14 @@
   <div class="panel">
     <h2>Event</h2>
     <div class="row">
-      <div class="field" style="flex:2;">
+      <div class="field" style="flex:1 1 100%;">
         <label>Event name</label>
-        <input type="text" id="eventName" placeholder="e.g. Sept 5 - Seychelle (75 Gold) - Fruella's">
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="eventName" list="eventNameList" autocomplete="off" style="flex:1; min-width:0;" placeholder="Pick from the list or type an event name">
+          <button type="button" class="apply-btn" id="fetchBtn" style="white-space:nowrap;" onclick="fetchEventData()">Fetch Data</button>
+        </div>
+        <datalist id="eventNameList"></datalist>
+        <div class="hint" id="eventListHint">Click the field to load events from the Computation 2.0 sheet (Google sign-in needed).</div>
       </div>
       <div class="field">
         <label>Pax</label>
@@ -140,10 +145,22 @@
           <option value="Silver">Silver</option>
           <option value="Rosegold" selected>Rosegold</option>
         </select>
-        <div class="hint">From Bookings tab, column J</div>
+        <div class="hint">Fetch Data fills this from the Bookings tab (column J)</div>
       </div>
     </div>
-  </div>  <div class="panel">
+    <div id="fetchStatus" style="display:none; white-space:pre-line; font-size:13px; line-height:1.5; padding:10px 14px; border-radius:6px; margin-top:4px; font-family:var(--font-mono);"></div>
+    <div id="fetchSuggestions" style="display:none; margin-top:8px; padding:12px; background:var(--bg-panel-2); border:1px solid var(--line); border-radius:8px;">
+      <div style="font-size:12px; color:var(--text-dim); margin-bottom:8px; font-family:var(--font-mono);">No exact match found. Did you mean:</div>
+      <div id="fetchSuggestionList"></div>
+    </div>
+    <div id="fetchConfirm" style="display:none; margin-top:8px; padding:14px; background:rgba(224,152,90,.1); border:1px solid var(--copper); border-radius:8px;">
+      <div id="fetchConfirmText" style="font-size:13px; color:var(--text); margin-bottom:10px; line-height:1.5;"></div>
+      <button type="button" onclick="confirmFetchReplace()" style="background:var(--copper); border:none; color:#1a1310; font-weight:700; padding:8px 16px; border-radius:6px; cursor:pointer; margin-right:8px; font-family:var(--font-body);">Yes, replace</button>
+      <button type="button" onclick="cancelFetchReplace()" style="background:none; border:1px solid var(--line); color:var(--text-dim); padding:8px 16px; border-radius:6px; cursor:pointer; font-family:var(--font-body);">Cancel</button>
+    </div>
+  </div>
+
+  <div class="panel">
     <h2>Cocktail List &amp; Allocation</h2>
     <div class="mode-toggle">
       <div class="mode-btn active" id="modePct" onclick="setMode('pct')">% of total cups</div>
@@ -254,7 +271,12 @@ function addRow(){
 
 function removeRow(id){ document.getElementById(id).remove(); updatePreview(); }
 
+// When Fetch Data pulls a total-cups figure that differs from pax x multiplier
+// (e.g. extensions), it is stored here and used as-is until pax/multiplier is edited.
+let totalCupsOverride = null;
+
 function getTargetCups(){
+  if(totalCupsOverride !== null) return totalCupsOverride;
   const pax = parseFloat(document.getElementById('pax').value) || 0;
   const mult = parseFloat(document.getElementById('multiplier').value) || 0;
   return pax * mult;
@@ -262,7 +284,7 @@ function getTargetCups(){
 
 function updatePreview(){
   const target = getTargetCups();
-  document.getElementById('totalCupsLabel').textContent = Math.round(target);
+  document.getElementById('totalCupsLabel').textContent = Math.round(target) + (totalCupsOverride !== null ? ' (from sheet)' : '');
   let allocatedCups = 0;
   document.querySelectorAll('.cocktail-row').forEach(row=>{
     const val = parseFloat(row.querySelector('.cval input').value) || 0;
@@ -292,8 +314,8 @@ function applyAllocation(){
   btn.textContent = 'Applied ✓';
 }
 
-document.getElementById('pax').addEventListener('input', updatePreview);
-document.getElementById('multiplier').addEventListener('input', updatePreview);
+document.getElementById('pax').addEventListener('input', ()=>{ totalCupsOverride = null; updatePreview(); });
+document.getElementById('multiplier').addEventListener('input', ()=>{ totalCupsOverride = null; updatePreview(); });
 
 function isGarnish(name){ return /garnish|rosemary/i.test(name); }
 
@@ -648,8 +670,7 @@ function initGoogleAuth(retriesLeft){
       scope: GOOGLE_SCOPES,
       callback: (resp) => {
         if(resp.error){
-          showStatus('Google sign-in failed: ' + resp.error, true);
-          setDriveBtnBusy(false);
+          handleGoogleAuthFailure('Google sign-in failed: ' + resp.error);
           return;
         }
         driveAccessToken = resp.access_token;
@@ -658,6 +679,11 @@ function initGoogleAuth(retriesLeft){
           pendingDriveAction = null;
           action();
         }
+      },
+      error_callback: (err) => {
+        // popup closed, or blocked by the browser
+        const why = (err && err.type === 'popup_failed_to_open') ? 'the sign-in popup was blocked by the browser' : 'the sign-in popup was closed';
+        handleGoogleAuthFailure('Google sign-in did not complete: ' + why + '.');
       }
     });
     if(statusEl){
@@ -671,6 +697,27 @@ function initGoogleAuth(retriesLeft){
       statusEl.style.color = 'var(--danger)';
     }
   }
+}
+
+// One place to report a failed/cancelled sign-in and un-stick any buttons
+// that were waiting on it.
+function handleGoogleAuthFailure(message){
+  pendingDriveAction = null;
+  setDriveBtnBusy(false);
+  setSheetSyncBusy(false);
+  setFetchBusy(false);
+  let handled = false;
+  if(fetchWaitingForAuth){
+    fetchWaitingForAuth = false;
+    showFetchStatus(message, 'error');
+    handled = true;
+  }
+  if(eventListState === 'loading'){
+    eventListState = 'idle';
+    setEventHint('Could not load events — ' + message + ' Click the field to try again.', true);
+    handled = true;
+  }
+  if(!handled) showStatus(message, true);
 }
 
 function setDriveBtnBusy(busy, label){
@@ -870,15 +917,12 @@ async function writeIngredientsToColumn(colIndex, ingredientRows){
 function renderSheetSyncSuggestions(matches){
   const container = document.getElementById('sheetSyncSuggestions');
   const list = document.getElementById('sheetSyncSuggestionList');
+  container.style.display = 'block';
   if(matches.length === 0){
-    container.style.display = 'block';
     list.innerHTML = '<div style="font-size:13px; color:var(--text-dim);">No similar event names found in Computation 2.0. Check the tab for the exact event name and try again.</div>';
     return;
   }
-  container.style.display = 'block';
-  list.innerHTML = matches.map(m =>
-    `<button class="add-btn" style="display:block; width:100%; text-align:left; margin-bottom:6px;" onclick="syncToSheet(${JSON.stringify(m.name)})">${xesc(m.name)}</button>`
-  ).join('');
+  renderNameSuggestions(list, matches.map(m => m.name), n => syncToSheet(n));
 }
 
 async function syncToSheet(overrideEventName){
@@ -899,7 +943,7 @@ async function syncToSheet(overrideEventName){
         showStatus('No exact match for "' + targetName + '" in Computation 2.0.', true);
         const candidates = headerRow
           .map((name, idx) => ({name: (name||'').trim(), idx}))
-          .filter(c => c.name.length > 0);
+          .filter(c => c.name.length > 0 && !isMonthHeading(c.name));
         const scored = candidates.map(c => ({name: c.name, dist: levenshtein(c.name, targetName)}))
           .sort((a,b) => a.dist - b.dist)
           .slice(0, 5);
@@ -966,6 +1010,528 @@ async function exportDoc(){
  }
 }
 
+// ============================================================
+// Event dropdown + Fetch Data (reads rows 1-12 of Computation 2.0)
+// ============================================================
+
+// ---- FETCH HELPERS (pure) START ----
+function normText(s){
+  return String(s == null ? '' : s)
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u2018\u2019]/g, "'")
+    .toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+// normalized cocktail name -> the exact key used in RECIPES
+const RECIPE_LOOKUP = {};
+Object.keys(RECIPES).forEach(k => { RECIPE_LOOKUP[normText(k)] = k; });
+
+function sheetCell(rows, r, c){
+  const row = rows[r];
+  if(!row) return '';
+  const v = row[c];
+  return (v === undefined || v === null) ? '' : String(v).trim();
+}
+
+// First number in the text, or NaN ("#REF!", "", "n/a" -> NaN)
+function parseNumber(s){
+  const m = String(s == null ? '' : s).replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+  return m ? parseFloat(m[0]) : NaN;
+}
+
+// Allocation cell -> percent number. null = blank, NaN = unreadable (e.g. #REF!)
+// "30%" -> 30; "30" -> 30; "0.3" -> 30
+function parseAllocationPct(s){
+  const t = String(s == null ? '' : s).trim();
+  if(t === '') return null;
+  const n = parseNumber(t);
+  if(isNaN(n)) return NaN;
+  if(t.indexOf('%') !== -1) return n;
+  if(n > 0 && n <= 1) return n * 100;
+  return n;
+}
+
+// Which beer / liquor does a list line refer to? (input is normalized text)
+function detectDrinkKind(norm){
+  if(/\bpale\b|pilsen/.test(norm)) return 'pale';       // San Miguel Pale Pilsen
+  if(/\blight\b/.test(norm)) return 'light';            // San Miguel Light
+  if(/cuervo|\bjose\b/.test(norm)) return 'cuervo';     // Jose Cuervo Gold
+  if(/\bblack\b|johnny|walker/.test(norm)) return 'black'; // Johnny Walker Black Label
+  return null;
+}
+
+// rows = values from 'Computation 2.0'!1:12 (array of arrays, ragged)
+// colIndex = 0-based column of the event name in row 1 (also the cocktail-name column)
+function parseEventBlock(rows, colIndex){
+  const pax = parseNumber(sheetCell(rows, 1, colIndex + 1));        // row 2
+  const totalCups = parseNumber(sheetCell(rows, 1, colIndex + 2));  // row 2
+  const cocktails = [], unmatched = [], noQty = [];
+  const found = {pale: null, light: null, cuervo: null, black: null};
+
+  for(let r = 2; r <= 11; r++){                                      // sheet rows 3-12
+    const label = sheetCell(rows, r, colIndex);
+    if(!label) continue;
+    const norm = normText(label);
+    if(norm === 'cocktail list:' || norm === 'cocktail list') continue;
+    const pctCell = sheetCell(rows, r, colIndex + 1);
+
+    const recipeKey = RECIPE_LOOKUP[norm];
+    if(recipeKey){
+      cocktails.push({name: recipeKey, sheetName: label, pct: parseAllocationPct(pctCell), row: r + 1});
+      continue;
+    }
+    const kind = detectDrinkKind(norm);
+    if(kind){
+      let qty = parseNumber(label);               // "Pale 2"
+      if(isNaN(qty)) qty = parseNumber(pctCell);  // quantity typed in the next cell
+      if(isNaN(qty)) noQty.push(label);
+      else found[kind] = (found[kind] || 0) + qty;
+      continue;
+    }
+    unmatched.push({label, pct: parseAllocationPct(pctCell), row: r + 1});
+  }
+  return {pax, totalCups, cocktails, unmatched, found, noQty};
+}
+
+// Substring matches first (typing "Nov 23" finds the event), else closest by edit distance
+function suggestEventNames(typed, names){
+  const t = normText(typed);
+  if(t){
+    const subs = names.filter(n => normText(n).indexOf(t) !== -1);
+    if(subs.length) return subs.slice(0, 5);
+  }
+  return names
+    .map(n => ({n, d: levenshtein(normText(n), t)}))
+    .sort((a, b) => a.d - b.d)
+    .slice(0, 5)
+    .map(x => x.n);
+}
+
+function summarizeFetched(p, eventName, multiplier, cup, preferredYear){
+  const warnings = [];
+  const paxOk = !isNaN(p.pax) && p.pax > 0;
+  const cupsOk = !isNaN(p.totalCups) && p.totalCups > 0;
+
+  let cupsText;
+  if(cupsOk){
+    cupsText = Math.round(p.totalCups) + ' total cups';
+  } else if(paxOk){
+    cupsText = Math.round(p.pax * multiplier) + ' total cups (pax \u00d7 ' + multiplier + ')';
+    warnings.push('Total cups in row 2 was blank or not a number, so I used pax \u00d7 ' + multiplier + '.');
+  } else {
+    cupsText = 'no total cups';
+    warnings.push('Row 2 has no pax or total cups for this event \u2014 cup counts stay at 0 until you fill pax in.');
+  }
+  if(!paxOk && cupsOk) warnings.push('Row 2 has no pax number \u2014 please fill it in (the Egg White / Bitters / Vanilla rules depend on it).');
+
+  const noAlloc = p.cocktails.filter(c => c.pct === null).map(c => c.sheetName);
+  if(noAlloc.length) warnings.push('No allocation in the sheet for: ' + noAlloc.join(', ') + ' (set to 0).');
+  const badAlloc = p.cocktails.filter(c => c.pct !== null && isNaN(c.pct)).map(c => c.sheetName);
+  if(badAlloc.length) warnings.push("Couldn't read the allocation for: " + badAlloc.join(', ') + ' (set to 0).');
+  p.unmatched.forEach(u => warnings.push("Couldn't match \"" + u.label + '" (row ' + u.row + ') to a recipe \u2014 pick one or remove the row.'));
+  p.noQty.forEach(l => warnings.push('Found "' + l + '" but no quantity \u2014 set it below.'));
+
+  const sum = p.cocktails.concat(p.unmatched).reduce((a, c) => a + ((c.pct !== null && !isNaN(c.pct)) ? c.pct : 0), 0);
+  if(sum > 0 && Math.abs(sum - 100) > 0.5) warnings.push('Allocations add up to ' + (Math.round(sum * 10) / 10) + '%.');
+  if(p.cocktails.length + p.unmatched.length === 0) warnings.push('No cocktails found in rows 3\u201312 for this event.');
+
+  const drinks = [['Light', p.found.light], ['Pale', p.found.pale], ['Black', p.found.black], ['Cuervo', p.found.cuervo]]
+    .filter(x => x[1]).map(x => x[0] + ' ' + x[1]);
+  let headline = eventName + '\n' +
+    (paxOk ? p.pax + ' pax' : 'no pax') + ' \u00b7 ' + cupsText + ' \u00b7 ' +
+    (p.cocktails.length + p.unmatched.length) + ' cocktail row(s)\n' +
+    'Beer/liquor: ' + (drinks.length ? drinks.join(' \u00b7 ') : 'none found');
+
+  if(cup){
+    if(cup.action === 'set'){
+      headline += '\nCup color: ' + cup.color + ' (' + describeBooking(cup.booking) + ')';
+    } else if(cup.action === 'reset'){
+      headline += '\nCup color: not set (' + describeBooking(cup.booking) + ')';
+      warnings.push('Cup color: Bookings says "' + (cup.raw || 'blank') + '" \u2014 not a usable color, so the dropdown was reset. Pick one.');
+    } else {
+      headline += '\nCup color: left as ' + (cup.current || 'Select...');
+      const why = {
+        none: 'no booking found for that date in the Bookings tab',
+        ambiguous: 'several bookings share that date and I could not tell which one this is',
+        unparsed: 'could not read a date from the event name',
+        error: 'could not read the Bookings tab' + (cup.errorText ? ' (' + cup.errorText + ')' : '')
+      }[cup.reason] || 'no matching booking';
+      warnings.push('Cup color: ' + why + ' \u2014 left unchanged.');
+    }
+    if(cup.action === 'set' || cup.action === 'reset'){
+      if(cup.how === 'date') warnings.push('Cup color: matched by date only (no client or venue words in common) \u2014 double-check it is the right booking.');
+      if(preferredYear && cup.booking.y !== preferredYear) warnings.push('Cup color: the matched booking is from ' + cup.booking.y + ' \u2014 double-check it.');
+    }
+  }
+  return {headline, warnings};
+}
+
+// ---- Cup color from the Bookings tab ----
+const MONTH_NUM = {jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12};
+const MON_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+// Month names used as section headings in row 1 ("JANUARY") are not events
+function isMonthHeading(name){
+  return /^(january|february|march|april|may|june|july|august|september|october|november|december)$/i.test(String(name == null ? '' : name).trim());
+}
+
+// "Nov 23 - Rose Anne Lugay (75 Gold) - Tagaytay Highlands (370 cups)"
+//   -> {month: 11, day: 23, client: "Rose Anne Lugay", venue: "Tagaytay Highlands"}
+function parseEventName(name){
+  const m = String(name == null ? '' : name).match(/^\s*([A-Za-z]+)\.?\s+(\d{1,2})\s*-\s*(.*)$/);
+  if(!m) return null;
+  const month = MONTH_NUM[m[1].slice(0, 3).toLowerCase()];
+  const day = parseInt(m[2], 10);
+  if(!month || day < 1 || day > 31) return null;
+  const rest = m[3];
+  const mm = rest.match(/^(.*?)\s*\(([^)]*)\)\s*-?\s*(.*)$/);   // client (pax package) - venue
+  const client = mm ? mm[1] : rest;
+  const venue = (mm ? mm[3] : '').replace(/\(\s*\d+\s*cups?\s*\)/ig, '').trim();
+  return {month, day, client, venue};
+}
+
+const NAME_STOPWORDS = new Set(['the','of','de','la','at','and','event','events','place','venue','hall','garden','gardens','resort','hotel','city','tagaytay','batangas','cavite','manila','hour','hours','extend','extnd','extension','cups','cup','pax']);
+function nameTokens(s){
+  const t = normText(s).match(/[a-z]+/g) || [];
+  return new Set(t.filter(w => w.length > 2 && !NAME_STOPWORDS.has(w)));
+}
+function overlapCount(a, b){ let n = 0; a.forEach(x => { if(b.has(x)) n++; }); return n; }
+
+// Google Sheets date serial (days since 1899-12-30) -> {y, m, d}
+function excelSerialToYMD(serial){
+  const d = new Date(Math.floor(serial - 25569) * 86400000);
+  return {y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate()};
+}
+
+// values = 'Bookings'!A:J as unformatted values. A = event date, C = client, I = venue, J = cups.
+// Rows whose column A isn't a real date (year banners, blanks) are skipped.
+function buildBookings(values){
+  const out = [];
+  (values || []).forEach((row, i) => {
+    const serial = row && row[0];
+    if(typeof serial !== 'number' || serial < 30000 || serial > 80000) return;
+    const ymd = excelSerialToYMD(serial);
+    const cell = idx => (row[idx] === undefined || row[idx] === null) ? '' : String(row[idx]).trim();
+    out.push({row: i + 1, y: ymd.y, m: ymd.m, d: ymd.d, client: cell(2), venue: cell(8), cups: cell(9)});
+  });
+  return out;
+}
+
+// Same month/day (within a year of preferredYear), then the booking sharing the most
+// client/venue words. With no shared words, fall back to the only booking that day this year.
+function findBookingForEvent(eventName, bookings, preferredYear){
+  const p = parseEventName(eventName);
+  if(!p) return {status: 'unparsed'};
+  const sameDay = bookings.filter(b => b.m === p.month && b.d === p.day && Math.abs(b.y - preferredYear) <= 1);
+  if(!sameDay.length) return {status: 'none'};
+  const ct = nameTokens(p.client), vt = nameTokens(p.venue);
+  const scored = sameDay.map(b => ({b, score: overlapCount(ct, nameTokens(b.client)) + overlapCount(vt, nameTokens(b.venue))}));
+  const best = Math.max.apply(null, scored.map(x => x.score));
+  if(best >= 1){
+    let top = scored.filter(x => x.score === best);
+    if(top.length > 1){
+      const inYear = top.filter(x => x.b.y === preferredYear);
+      if(inYear.length === 1) top = inYear;
+    }
+    if(top.length === 1) return {status: 'matched', how: 'name', booking: top[0].b};
+    return {status: 'ambiguous'};
+  }
+  const thisYear = sameDay.filter(b => b.y === preferredYear);
+  if(thisYear.length === 1) return {status: 'matched', how: 'date', booking: thisYear[0]};
+  return {status: thisYear.length > 1 ? 'ambiguous' : 'none'};
+}
+
+// Only the exact three colors count ("Rose gold", "gold ", "RoseGold" are fine);
+// anything else ("To follow", "Rosegold and Silver", "Silver (tentative)", blank) is unusable.
+const CUP_COLORS = {gold: 'Gold', silver: 'Silver', rosegold: 'Rosegold'};
+function normalizeCupColor(raw){
+  const key = String(raw == null ? '' : raw).toLowerCase().replace(/[^a-z]/g, '');
+  return Object.prototype.hasOwnProperty.call(CUP_COLORS, key) ? CUP_COLORS[key] : '';
+}
+
+function decideCupColor(found){
+  if(found.status === 'matched'){
+    const color = normalizeCupColor(found.booking.cups);
+    return {action: color ? 'set' : 'reset', color: color, raw: found.booking.cups, booking: found.booking, how: found.how};
+  }
+  return {action: 'keep', reason: found.status};   // none | ambiguous | unparsed
+}
+
+function describeBooking(b){
+  return 'Bookings row ' + b.row + ' \u00b7 ' + MON_ABBR[b.m - 1] + ' ' + b.d + ', ' + b.y + ' \u00b7 ' +
+    (b.client || 'no client') + (b.venue ? ' @ ' + b.venue : '');
+}
+// ---- FETCH HELPERS (pure) END ----
+
+let eventListState = 'idle';      // 'idle' | 'loading' | 'loaded'
+let eventNamesCache = [];
+let fetchWaitingForAuth = false;
+let pendingFetch = null;
+
+function setEventHint(msg, isError){
+  const el = document.getElementById('eventListHint');
+  el.textContent = msg;
+  el.style.color = isError ? 'var(--danger)' : '';
+}
+
+function setFetchBusy(busy){
+  const b = document.getElementById('fetchBtn');
+  b.disabled = busy;
+  b.textContent = busy ? 'Fetching...' : 'Fetch Data';
+}
+
+function showFetchStatus(msg, kind){
+  const el = document.getElementById('fetchStatus');
+  const palette = {
+    ok:    ['rgba(168,194,86,.12)', 'var(--lime)'],
+    warn:  ['rgba(224,152,90,.12)', 'var(--copper-bright)'],
+    error: ['rgba(194,91,74,.12)',  'var(--danger)']
+  }[kind || 'ok'];
+  el.style.display = 'block';
+  el.textContent = msg;
+  el.style.background = palette[0];
+  el.style.border = '1px solid ' + palette[1];
+  el.style.color = palette[1];
+}
+
+function hideFetchPanels(){
+  document.getElementById('fetchStatus').style.display = 'none';
+  document.getElementById('fetchSuggestions').style.display = 'none';
+  document.getElementById('fetchConfirm').style.display = 'none';
+}
+
+// Buttons built with the DOM (not innerHTML + onclick) so names containing
+// quotes or apostrophes can't break them.
+function renderNameSuggestions(listEl, names, onPick){
+  listEl.innerHTML = '';
+  names.forEach(n => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'add-btn';
+    b.style.cssText = 'display:block; width:100%; text-align:left; margin-bottom:6px;';
+    b.textContent = n;
+    b.addEventListener('click', () => onPick(n));
+    listEl.appendChild(b);
+  });
+}
+
+function populateEventList(headerRow){
+  const seen = new Set();
+  const names = [];
+  headerRow.forEach(v => {
+    const n = String(v == null ? '' : v).trim();
+    if(n && !seen.has(n) && !isMonthHeading(n)){ seen.add(n); names.push(n); }
+  });
+  eventNamesCache = names;
+  const dl = document.getElementById('eventNameList');
+  dl.innerHTML = '';
+  names.forEach(n => { const o = document.createElement('option'); o.value = n; dl.appendChild(o); });
+  return names;
+}
+
+async function getEventBlockRows(){
+  const range = encodeURIComponent(`'${COMPUTATION_SHEET_NAME}'!1:12`);
+  const data = await sheetsApiFetch(`https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SHEET_ID}/values/${range}`, {method: 'GET'});
+  return data.values || [];
+}
+
+const BOOKINGS_SHEET_NAME = 'Bookings';
+async function getBookingsValues(){
+  const range = encodeURIComponent(`'${BOOKINGS_SHEET_NAME}'!A:J`);
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${MASTER_SHEET_ID}/values/${range}?valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=SERIAL_NUMBER`;
+  const data = await sheetsApiFetch(url, {method: 'GET'});
+  return data.values || [];
+}
+
+// Run an action once we have a Google token. If a sign-in popup is already
+// pending, queue behind it instead of opening a second one.
+function runWithGoogleAuth(action){
+  if(driveAccessToken){ action(); return; }
+  const prev = pendingDriveAction;
+  pendingDriveAction = prev ? (() => { prev(); action(); }) : action;
+  if(!prev) driveTokenClient.requestAccessToken({prompt: ''});
+}
+
+// Clicking / focusing the event field loads the event names (needs a user gesture for the popup)
+function maybeLoadEventList(){
+  if(eventListState !== 'idle') return;
+  if(!driveTokenClient){ setEventHint('Google sign-in is still loading \u2014 click the field again in a moment.', true); return; }
+  eventListState = 'loading';
+  setEventHint('Loading events from the sheet\u2026');
+  const action = async () => {
+    try{
+      const header = await getEventHeaderRow();
+      const names = populateEventList(header);
+      eventListState = 'loaded';
+      setEventHint(names.length + ' events loaded \u2014 pick one or keep typing.');
+    } catch(err){
+      if(err.message === 'AUTH_EXPIRED'){ runWithGoogleAuth(action); return; }
+      eventListState = 'idle';
+      setEventHint('Could not load events: ' + err.message, true);
+    }
+  };
+  runWithGoogleAuth(action);
+}
+
+function formHasExistingInput(){
+  if(document.getElementById('pax').value.trim() !== '') return true;
+  const drinks = ['beerLight', 'beerPilsen', 'liquorJW', 'liquorCuervo'];
+  if(drinks.some(id => (parseFloat(document.getElementById(id).value) || 0) > 0)) return true;
+  return Array.from(document.querySelectorAll('.cocktail-row')).some(row =>
+    row.querySelector('.cname select').value || (parseFloat(row.querySelector('.cval input').value) || 0) > 0);
+}
+
+async function fetchEventData(overrideName){
+  const typed = String(overrideName || document.getElementById('eventName').value).trim();
+  hideFetchPanels();
+  if(!typed){ showFetchStatus('Pick or type an event name first.', 'error'); return; }
+  if(!driveTokenClient){ showFetchStatus('Google sign-in is still loading \u2014 try again in a moment.', 'error'); return; }
+
+  const action = async () => {
+    fetchWaitingForAuth = false;
+    try{
+      setFetchBusy(true);
+      showFetchStatus('Reading "' + typed + '" from Computation 2.0\u2026', 'ok');
+      const rows = await getEventBlockRows();
+      const headerRow = rows[0] || [];
+      const names = populateEventList(headerRow);
+      if(eventListState !== 'loaded'){
+        eventListState = 'loaded';
+        setEventHint(names.length + ' events loaded \u2014 pick one or keep typing.');
+      }
+
+      let colIndex = headerRow.findIndex(v => String(v == null ? '' : v).trim() === typed);
+      if(colIndex === -1){                       // tolerate case / spacing / curly-apostrophe differences
+        const want = normText(typed);
+        colIndex = headerRow.findIndex(v => normText(v) === want);
+      }
+      if(colIndex === -1){
+        showFetchStatus('No event named "' + typed + '" in Computation 2.0.', 'error');
+        renderNameSuggestions(document.getElementById('fetchSuggestionList'), suggestEventNames(typed, names), n => {
+          document.getElementById('eventName').value = n;
+          fetchEventData(n);
+        });
+        document.getElementById('fetchSuggestions').style.display = 'block';
+        return;
+      }
+
+      const eventName = String(headerRow[colIndex]).trim();
+      const parsed = parseEventBlock(rows, colIndex);
+      const multiplier = parseFloat(document.getElementById('multiplier').value) || 0;
+
+      // Cup color comes from the Bookings tab (column J), matched by date + client/venue words
+      const preferredYear = new Date().getFullYear();
+      let cup;
+      try{
+        const bookings = buildBookings(await getBookingsValues());
+        cup = decideCupColor(findBookingForEvent(eventName, bookings, preferredYear));
+      } catch(err){
+        if(err.message === 'AUTH_EXPIRED') throw err;
+        cup = {action: 'keep', reason: 'error', errorText: String(err.message).slice(0, 120)};
+      }
+      cup.current = document.getElementById('cupColor').value;
+      const summary = summarizeFetched(parsed, eventName, multiplier, cup, preferredYear);
+      const kind = summary.warnings.length ? 'warn' : 'ok';
+      const message = summary.headline +
+        (summary.warnings.length ? '\n\n' + summary.warnings.map(w => '\u2022 ' + w).join('\n') : '') +
+        '\n\nReview below, add notes, then click Calculate.';
+
+      if(formHasExistingInput()){
+        pendingFetch = {parsed, eventName, message, kind, cup};
+        const cupChanges = cup.action !== 'keep';
+        document.getElementById('fetchConfirmText').textContent =
+          'The form already has entries. Replace pax, cocktails, beer, liquor' + (cupChanges ? ' and cup color' : '') +
+          ' with the sheet data for "' + eventName + '"? (' + (cupChanges ? 'Notes stay' : 'Notes and cup color stay') + ' as they are.)';
+        document.getElementById('fetchConfirm').style.display = 'block';
+        showFetchStatus('Fetched "' + eventName + '" \u2014 waiting for your OK before replacing the current entries.', 'warn');
+      } else {
+        applyFetchedData(parsed, eventName, cup);
+        showFetchStatus(message, kind);
+      }
+    } catch(err){
+      if(err.message === 'AUTH_EXPIRED'){ fetchWaitingForAuth = true; runWithGoogleAuth(action); return; }
+      showFetchStatus('Fetch failed: ' + err.message, 'error');
+    } finally {
+      setFetchBusy(false);
+    }
+  };
+
+  fetchWaitingForAuth = true;   // cleared as soon as the action starts running
+  runWithGoogleAuth(action);
+}
+
+function applyFetchedData(p, eventName, cup){
+  document.getElementById('eventName').value = eventName;
+  if(cup && cup.action === 'set') document.getElementById('cupColor').value = cup.color;
+  else if(cup && cup.action === 'reset') document.getElementById('cupColor').value = '';
+
+  const mult = parseFloat(document.getElementById('multiplier').value) || 0;
+  const paxOk = !isNaN(p.pax) && p.pax > 0;
+  const cupsOk = !isNaN(p.totalCups) && p.totalCups > 0;
+  document.getElementById('pax').value = paxOk ? String(p.pax) : '';
+  // Use the sheet's total cups exactly when it isn't simply pax x multiplier (extensions)
+  totalCupsOverride = (cupsOk && (!paxOk || Math.abs(p.totalCups - p.pax * mult) > 1e-9)) ? p.totalCups : null;
+
+  setMode('pct');                       // allocation from the sheet is a % of total cups
+  const container = document.getElementById('cocktailRows');
+  container.innerHTML = '';
+  rowCount = 0;
+
+  const addFetchedRow = (selectValue, pct, hintText) => {
+    addRow();
+    const row = container.lastElementChild;
+    if(selectValue) row.querySelector('.cname select').value = selectValue;
+    const val = (pct === null || isNaN(pct)) ? 0 : Math.round(pct * 100) / 100;
+    row.querySelector('.cval input').value = String(val);
+    if(hintText){
+      const h = document.createElement('div');
+      h.className = 'hint';
+      h.style.color = 'var(--danger)';
+      h.textContent = hintText;
+      const nameField = row.querySelector('.cname');
+      nameField.insertBefore(h, nameField.querySelector('label'));
+    }
+  };
+  p.cocktails.forEach(c => addFetchedRow(c.name, c.pct, ''));
+  p.unmatched.forEach(u => addFetchedRow('', u.pct, 'Sheet says "' + u.label + '" \u2014 pick a recipe or remove this row'));
+  if(p.cocktails.length + p.unmatched.length === 0){ addRow(); addRow(); addRow(); }
+
+  document.getElementById('beerLight').value = String(p.found.light || 0);
+  document.getElementById('beerPilsen').value = String(p.found.pale || 0);
+  document.getElementById('liquorJW').value = String(p.found.black || 0);
+  document.getElementById('liquorCuervo').value = String(p.found.cuervo || 0);
+
+  // Anything calculated earlier is now out of date
+  lastResults = null;
+  document.getElementById('resultsPanel').style.display = 'none';
+  ['exportBtn', 'driveBtn', 'sheetSyncBtn'].forEach(id => { document.getElementById(id).style.display = 'none'; });
+  document.getElementById('sheetSyncSuggestions').style.display = 'none';
+  clearStatus();
+  updatePreview();
+}
+
+function confirmFetchReplace(){
+  if(!pendingFetch) return;
+  const {parsed, eventName, message, kind, cup} = pendingFetch;
+  pendingFetch = null;
+  document.getElementById('fetchConfirm').style.display = 'none';
+  applyFetchedData(parsed, eventName, cup);
+  showFetchStatus(message, kind);
+}
+
+function cancelFetchReplace(){
+  pendingFetch = null;
+  document.getElementById('fetchConfirm').style.display = 'none';
+  showFetchStatus('Kept your current entries \u2014 nothing was replaced.', 'ok');
+}
+
+(function(){
+  const el = document.getElementById('eventName');
+  el.addEventListener('focus', maybeLoadEventList);
+  el.addEventListener('click', maybeLoadEventList);
+})();
+
+
 function requestReset(){
   document.getElementById('resetConfirm').style.display = 'block';
   document.getElementById('resetConfirm').scrollIntoView({behavior:'smooth', block:'nearest'});
@@ -998,6 +1564,9 @@ function doReset(){
   document.getElementById('sheetSyncBtn').style.display = 'none';
   document.getElementById('sheetSyncSuggestions').style.display = 'none';
   clearStatus();
+  totalCupsOverride = null;
+  pendingFetch = null;
+  hideFetchPanels();
 
   document.getElementById('resetConfirm').style.display = 'none';
 }
